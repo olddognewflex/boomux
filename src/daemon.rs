@@ -167,10 +167,14 @@ unset _boomux_entry _boomux_filtered _boomux_path
 const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
   source "$BOOMUX_USER_ZDOTDIR/.zshenv"
 fi
-typeset -gx BOOMUX_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+if [[ -n "$ZDOTDIR" && "$ZDOTDIR" != "$BOOMUX_OPENCODE_SHIM_DIR" ]]; then
+  typeset -gx BOOMUX_USER_ZDOTDIR="$ZDOTDIR"
+fi
+typeset -gx BOOMUX_USER_ZDOTDIR="${BOOMUX_USER_ZDOTDIR:-$HOME}"
 typeset -gx ZDOTDIR="$BOOMUX_OPENCODE_SHIM_DIR"
 "#;
-const OPENCODE_ZSH_RC: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshrc" ]]; then
+const OPENCODE_ZSH_RC: &[u8] =
+    br#"if [[ "$BOOMUX_USER_ZDOTDIR" != "$ZDOTDIR" && -r "$BOOMUX_USER_ZDOTDIR/.zshrc" ]]; then
   source "$BOOMUX_USER_ZDOTDIR/.zshrc"
 fi
 path=("${(@)path:#$BOOMUX_OPENCODE_SHIM_DIR}")
@@ -18715,6 +18719,54 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn zsh_startup_runs_user_config_once_and_restores_zdotdir() {
+        if !Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let directory = env::temp_dir().join(format!("boomux-zshrc-{}", Uuid::new_v4()));
+        let shims = directory.join("shims");
+        let user = directory.join("user");
+        fs::create_dir_all(&shims).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        fs::write(shims.join(".zshenv"), OPENCODE_ZSH_ENV).unwrap();
+        fs::write(shims.join(".zshrc"), OPENCODE_ZSH_RC).unwrap();
+        fs::write(user.join(".zshenv"), b"typeset -gx BOOMUX_TEST_ENV=1\n").unwrap();
+        fs::write(
+            user.join(".zshrc"),
+            b"typeset -gx BOOMUX_TEST_RC=$((BOOMUX_TEST_RC + 1))\n",
+        )
+        .unwrap();
+
+        let output = Command::new("/bin/zsh")
+            .args([
+                "-i",
+                "-c",
+                "print -r -- \"$ZDOTDIR|$BOOMUX_TEST_ENV|$BOOMUX_TEST_RC|${PATH%%:*}|$BOOMUX_ORIGINAL_PATH\"",
+            ])
+            .env_clear()
+            .env("HOME", &directory)
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .env("BOOMUX_OPENCODE_SHIM_DIR", &shims)
+            .env("BOOMUX_USER_ZDOTDIR", &user)
+            .env("ZDOTDIR", &shims)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("recursion"), "{stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let fields = stdout.trim().split('|').collect::<Vec<_>>();
+        assert_eq!(fields[0], user.to_str().unwrap(), "{stdout}");
+        assert_eq!(fields[1], "1", "{stdout}");
+        assert_eq!(fields[2], "1", "{stdout}");
+        assert_eq!(fields[3], shims.to_str().unwrap(), "{stdout}");
+        assert_eq!(fields[4], "/usr/bin:/bin", "{stdout}");
         fs::remove_dir_all(directory).unwrap();
     }
 
